@@ -694,6 +694,40 @@ def get_error_message(exc_value: "Optional[BaseException]") -> str:
     return message
 
 
+def _is_cancellation_exception(exc_value: "Optional[BaseException]") -> bool:
+    """
+    Checks whether the exception represents a cancellation of concurrent work.
+
+    ``asyncio.CancelledError`` is raised when a task is cancelled; in the context
+    of an ``ExceptionGroup`` a cancelled sibling is structurally different from a
+    sibling that raised a real error and should be marked as such so issue
+    grouping can tell the cancellation branch apart from the error branches.
+    """
+    if exc_value is None:
+        return False
+
+    # Match by module/name instead of importing asyncio: importing asyncio
+    # installs an event loop policy as a side effect, and CancelledError is a
+    # BaseException (not Exception) on Python >= 3.8. The module check avoids
+    # flagging unrelated user types that happen to be called CancelledError,
+    # while covering the cancellations surfaced by asyncio-based task libraries
+    # (asyncio.TaskGroup, anyio) and concurrent.futures.
+    module = get_type_module(type(exc_value)) or ""
+    name = get_type_name(type(exc_value)) or ""
+
+    if name != "CancelledError":
+        return False
+
+    return (
+        module == "asyncio"
+        or module == "asyncio.exceptions"
+        or module == "concurrent.futures"
+        or module == "concurrent.futures._base"
+        or module == "anyio"
+        or module.startswith("anyio.")
+    )
+
+
 def single_exception_from_error_tuple(
     exc_type: "Optional[type]",
     exc_value: "Optional[BaseException]",
@@ -704,6 +738,7 @@ def single_exception_from_error_tuple(
     parent_id: "Optional[int]" = None,
     source: "Optional[str]" = None,
     full_stack: "Optional[list[dict[str, Any]]]" = None,
+    is_cancellation: bool = False,
 ) -> "Dict[str, Any]":
     """
     Creates a dict that goes into the events `exception.values` list and is ingestible by Sentry.
@@ -744,6 +779,9 @@ def single_exception_from_error_tuple(
     )
     if is_exception_group:
         exception_value["mechanism"]["is_exception_group"] = True
+
+    if is_cancellation:
+        exception_value["mechanism"]["is_cancellation"] = True
 
     exception_value["module"] = get_type_module(exc_type)
     exception_value["type"] = get_type_name(exc_type)
@@ -835,6 +873,69 @@ else:
         yield exc_info
 
 
+def _exception_reference_value(
+    referenced_id: int,
+    mechanism: "Optional[Dict[str, Any]]",
+    exception_id: int,
+    parent_id: int,
+    source: "Optional[str]",
+    is_cancellation: bool = False,
+) -> "Dict[str, Any]":
+    """
+    Creates a lightweight reference entry for ``exception.values``.
+
+    A shared leaf (one exception object reachable through more than one branch of
+    an exception tree, e.g. two sibling tasks failing with the *same* exception
+    object) is serialized only once. Every additional occurrence is emitted as a
+    reference node that points at the serialized node via
+    ``mechanism.exception_ref``.
+
+    Reference nodes intentionally do not carry ``type``/``value``/``stacktrace``
+    so they cannot be mistaken for a second occurrence of the error by issue
+    grouping. The synthetic id they carry is not the id of the serialized node;
+    it only serves to express the edge (``parent_id``) that leads to the
+    reference, while ``exception_ref`` points at the node that holds the payload.
+    """
+    exception_value: "Dict[str, Any]" = {}
+    exception_value["mechanism"] = (
+        mechanism.copy() if mechanism else {"type": "generic", "handled": True}
+    )
+    exception_value["mechanism"]["exception_id"] = exception_id
+    exception_value["mechanism"]["parent_id"] = parent_id
+    exception_value["mechanism"]["type"] = "chained"
+    if source is not None:
+        exception_value["mechanism"]["source"] = source
+    if is_cancellation:
+        exception_value["mechanism"]["is_cancellation"] = True
+    exception_value["mechanism"]["exception_ref"] = referenced_id
+
+    return exception_value
+
+
+def _chain_relation(
+    exc_value: BaseException,
+) -> "Tuple[Optional[BaseException], Optional[str]]":
+    """
+    Returns the chained exception (``__cause__`` or ``__context__``) and the
+    name of the relation, preserving the semantic difference between a direct
+    cause (raised with ``raise ... from ...``) and a contextual cause (another
+    exception was being handled).
+
+    Following Python's own traceback rendering, when ``__suppress_context__`` is
+    set only the direct cause is reported; otherwise the implicit context is
+    reported.
+    """
+    if not hasattr(exc_value, "__suppress_context__"):
+        return None, None
+
+    if exc_value.__suppress_context__:
+        cause = getattr(exc_value, "__cause__", None)
+        return (cause, "__cause__") if cause is not None else (None, None)
+
+    context = getattr(exc_value, "__context__", None)
+    return (context, "__context__") if context is not None else (None, None)
+
+
 def exceptions_from_error(
     exc_type: "Optional[type]",
     exc_value: "Optional[BaseException]",
@@ -846,11 +947,34 @@ def exceptions_from_error(
     source: "Optional[str]" = None,
     full_stack: "Optional[list[dict[str, Any]]]" = None,
     seen_exceptions: "Optional[list[BaseException]]" = None,
-    seen_exception_ids: "Optional[Set[int]]" = None,
+    seen_exception_ids: "Optional[Dict[int, int]]" = None,
+    active_exception_ids: "Optional[Set[int]]" = None,
+    is_cancellation: bool = False,
 ) -> "Tuple[int, List[Dict[str, Any]]]":
     """
-    Creates the list of exceptions.
-    This can include chained exceptions and exceptions from an ExceptionGroup.
+    Builds the exception tree as a flat list of exception interface entries.
+
+    The tree mirrors the *object* graph of exceptions rather than walking it as
+    independent linear chains:
+
+    * Nodes are identified by the Python object identity (``id(exc_value)``), so
+      the resulting tree is stable regardless of the order in which concurrent
+      tasks populate an ``ExceptionGroup``.
+    * Each exception object is fully serialized (type/value/stacktrace) exactly
+      once, at its first (pre-order DFS) occurrence. Every further occurrence is
+      emitted as a lightweight ``mechanism.exception_ref`` reference back to the
+      serialized node -- shared leaves are never duplicated.
+    * Edges preserve their relation in ``mechanism.source``: ``__cause__`` for a
+      direct cause, ``__context__`` for a contextual cause and ``exceptions[i]``
+      for members of an ``ExceptionGroup``. Cancellation branches are flagged
+      with ``mechanism.is_cancellation``.
+    * Cyclic relationships are truncated safely: a node that is already active
+      on the current DFS path (or was serialized elsewhere in the tree) is
+      emitted as a reference instead of being expanded, so the traversal always
+      terminates.
+    * Reference nodes carry a synthetic ``exception_id`` (used for the edge) and
+      an ``exception_ref`` pointing at the node that holds the serialized
+      payload; they never duplicate type/value/stacktrace.
 
     See the Exception Interface documentation for more details:
     https://develop.sentry.dev/sdk/event-payloads/exception/
@@ -869,91 +993,97 @@ def exceptions_from_error(
             reconstruct the exception tree.
 
             Not to be confused with ``seen_exception_ids``, which tracks Python ``id()``
-            values for cycle detection.
+            values and maps them to the stable tree ``exception_id`` of their
+            serialized node.
     """
 
     if seen_exception_ids is None:
-        seen_exception_ids = set()
+        seen_exception_ids = {}
 
     if seen_exceptions is None:
         seen_exceptions = []
 
-    if exc_value is not None and id(exc_value) in seen_exception_ids:
+    if active_exception_ids is None:
+        active_exception_ids = set()
+
+    if exc_value is None:
         return (exception_id, [])
 
-    if exc_value is not None:
-        seen_exceptions.append(exc_value)
-        seen_exception_ids.add(id(exc_value))
+    obj_id = id(exc_value)
 
-    parent = single_exception_from_error_tuple(
+    # A node already serialized somewhere in the tree is a shared leaf/branch:
+    # keep it serialized exactly once and add a reference at this position.
+    if obj_id in seen_exception_ids:
+        reference = _exception_reference_value(
+            referenced_id=seen_exception_ids[obj_id],
+            mechanism=mechanism,
+            exception_id=exception_id,
+            parent_id=parent_id,
+            source=source,
+            is_cancellation=is_cancellation,
+        )
+        return (exception_id + 1, [reference])
+
+    # A node active on the current DFS path closes a cycle. Its stable id was
+    # recorded when the ancestor node was entered; point back at that node and
+    # do not expand it again.
+    if obj_id in active_exception_ids:
+        reference = _exception_reference_value(
+            referenced_id=seen_exception_ids[obj_id],
+            mechanism=mechanism,
+            exception_id=exception_id,
+            parent_id=parent_id,
+            source=source,
+            is_cancellation=is_cancellation,
+        )
+        return (exception_id + 1, [reference])
+
+    # Keep a reference so the `id` is not reused for another object while we
+    # build the tree, and remember the stable tree id assigned to this node.
+    node_id = exception_id
+    seen_exceptions.append(exc_value)
+    seen_exception_ids[obj_id] = node_id
+    active_exception_ids.add(obj_id)
+
+    node = single_exception_from_error_tuple(
         exc_type=exc_type,
         exc_value=exc_value,
         tb=tb,
         client_options=client_options,
         mechanism=mechanism,
-        exception_id=exception_id,
+        exception_id=node_id,
         parent_id=parent_id,
         source=source,
         full_stack=full_stack,
+        is_cancellation=is_cancellation,
     )
-    exceptions = [parent]
+    exceptions: "List[Dict[str, Any]]" = [node]
+    exception_id = node_id + 1
 
-    parent_id = exception_id
-    exception_id += 1
-
-    should_supress_context = (
-        hasattr(exc_value, "__suppress_context__") and exc_value.__suppress_context__  # type: ignore
-    )
-    if should_supress_context:
-        # Add direct cause.
-        # The field `__cause__` is set when raised with the exception (using the `from` keyword).
-        exception_has_cause = (
-            exc_value
-            and hasattr(exc_value, "__cause__")
-            and exc_value.__cause__ is not None
+    # Direct / contextual cause. This is a linear edge, so the child's parent is
+    # this node (in contrast to the old implementation that linked chained
+    # exceptions back to the root of the tree).
+    chained, relation = _chain_relation(exc_value)
+    if chained is not None:
+        (exception_id, child_exceptions) = exceptions_from_error(
+            exc_type=type(chained),
+            exc_value=chained,
+            tb=getattr(chained, "__traceback__", None),
+            client_options=client_options,
+            mechanism=mechanism,
+            exception_id=exception_id,
+            parent_id=node_id,
+            source=relation,
+            full_stack=full_stack,
+            seen_exceptions=seen_exceptions,
+            seen_exception_ids=seen_exception_ids,
+            active_exception_ids=active_exception_ids,
+            is_cancellation=_is_cancellation_exception(chained),
         )
-        if exception_has_cause:
-            cause = exc_value.__cause__  # type: ignore
-            (exception_id, child_exceptions) = exceptions_from_error(
-                exc_type=type(cause),
-                exc_value=cause,
-                tb=getattr(cause, "__traceback__", None),
-                client_options=client_options,
-                mechanism=mechanism,
-                exception_id=exception_id,
-                source="__cause__",
-                full_stack=full_stack,
-                seen_exceptions=seen_exceptions,
-                seen_exception_ids=seen_exception_ids,
-            )
-            exceptions.extend(child_exceptions)
+        exceptions.extend(child_exceptions)
 
-    else:
-        # Add indirect cause.
-        # The field `__context__` is assigned if another exception occurs while handling the exception.
-        exception_has_content = (
-            exc_value
-            and hasattr(exc_value, "__context__")
-            and exc_value.__context__ is not None
-        )
-        if exception_has_content:
-            context = exc_value.__context__  # type: ignore
-            (exception_id, child_exceptions) = exceptions_from_error(
-                exc_type=type(context),
-                exc_value=context,
-                tb=getattr(context, "__traceback__", None),
-                client_options=client_options,
-                mechanism=mechanism,
-                exception_id=exception_id,
-                source="__context__",
-                full_stack=full_stack,
-                seen_exceptions=seen_exceptions,
-                seen_exception_ids=seen_exception_ids,
-            )
-            exceptions.extend(child_exceptions)
-
-    # Add exceptions from an ExceptionGroup.
-    is_exception_group = exc_value and hasattr(exc_value, "exceptions")
+    # Members of an ExceptionGroup.
+    is_exception_group = hasattr(exc_value, "exceptions")
     if is_exception_group:
         for idx, e in enumerate(exc_value.exceptions):  # type: ignore
             (exception_id, child_exceptions) = exceptions_from_error(
@@ -963,13 +1093,17 @@ def exceptions_from_error(
                 client_options=client_options,
                 mechanism=mechanism,
                 exception_id=exception_id,
-                parent_id=parent_id,
+                parent_id=node_id,
                 source="exceptions[%s]" % idx,
                 full_stack=full_stack,
                 seen_exceptions=seen_exceptions,
                 seen_exception_ids=seen_exception_ids,
+                active_exception_ids=active_exception_ids,
+                is_cancellation=_is_cancellation_exception(e),
             )
             exceptions.extend(child_exceptions)
+
+    active_exception_ids.discard(obj_id)
 
     return (exception_id, exceptions)
 
@@ -987,6 +1121,9 @@ def exceptions_from_error_tuple(
     )
 
     if is_exception_group:
+        # ExceptionGroups (including concurrent.futures/asyncio task groups)
+        # form a real tree with siblings, shared leaves and possible cycles;
+        # build it identity-based so the grouping structure stays stable.
         (_, exceptions) = exceptions_from_error(
             exc_type=exc_type,
             exc_value=exc_value,
@@ -996,9 +1133,12 @@ def exceptions_from_error_tuple(
             exception_id=0,
             parent_id=0,
             full_stack=full_stack,
+            is_cancellation=_is_cancellation_exception(exc_value),
         )
 
     else:
+        # Single (possibly linearly chained) exception: keep the historical flat
+        # representation without tree metadata.
         exceptions = []
         for exc_type, exc_value, tb in walk_exception_chain(exc_info):
             exceptions.append(
@@ -1009,9 +1149,12 @@ def exceptions_from_error_tuple(
                     client_options=client_options,
                     mechanism=mechanism,
                     full_stack=full_stack,
+                    is_cancellation=_is_cancellation_exception(exc_value),
                 )
             )
 
+    # The exception interface lists exceptions oldest-first (root/raised-last at
+    # the end), matching the previous flat chain representation.
     exceptions.reverse()
 
     return exceptions

@@ -328,6 +328,10 @@ def test_exceptiongroup_starlette_collapse():
 
     Without cycle detection in exceptions_from_error(), this causes infinite
     recursion and a silent RecursionError that drops the event.
+
+    The cycle edge (ValueError -> ExceptionGroup) is emitted as an
+    exception_ref node instead of being expanded, and ValueError itself is
+    serialized exactly once.
     """
     exception_group = None
 
@@ -369,6 +373,16 @@ def test_exceptiongroup_starlette_collapse():
             del x["module"]
 
     expected_values = [
+        {
+            "mechanism": {
+                "exception_id": 3,
+                "handled": False,
+                "parent_id": 2,
+                "source": "__context__",
+                "type": "chained",
+                "exception_ref": 0,
+            },
+        },
         {
             "mechanism": {
                 "exception_id": 2,
@@ -434,9 +448,26 @@ def test_cyclic_exception_group_cause():
 
     # Must produce a finite list of exceptions without hitting RecursionError.
     assert len(exception_values) >= 1
-    exc_types = [v["type"] for v in exception_values]
-    assert "ExceptionGroup" in exc_types
-    assert "ValueError" in exc_types
+
+    by_id = {
+        v["mechanism"]["exception_id"]: v for v in exception_values
+    }
+
+    # The group (id 0) is the root; the ValueError (id 1) is its only child.
+    assert by_id[0]["type"] == "ExceptionGroup"
+    assert by_id[1]["type"] == "ValueError"
+    assert by_id[1]["mechanism"]["source"] == "exceptions[0]"
+    assert by_id[1]["mechanism"]["parent_id"] == 0
+
+    # ValueError.__cause__ points back at the group: the cycle is truncated with
+    # a reference node pointing at the already-serialized group, never expanded.
+    refs = [v for v in exception_values if "exception_ref" in v["mechanism"]]
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref["mechanism"]["exception_ref"] == 0
+    assert ref["mechanism"]["source"] == "__cause__"
+    assert ref["mechanism"]["parent_id"] == 1
+    assert "type" not in ref and "stacktrace" not in ref
 
 
 @minimum_python_311
@@ -470,7 +501,278 @@ def test_deeply_nested_cyclic_exception_group():
 
     exception_values = event["exception"]["values"]
     assert len(exception_values) >= 1
-    exc_types = [v["type"] for v in exception_values]
-    assert "ExceptionGroup" in exc_types
-    assert "ValueError" in exc_types
-    assert "TypeError" in exc_types
+
+    # Every serialized exception (non-reference) appears once.
+    concrete = [v for v in exception_values if "type" in v]
+    exc_types = [v["type"] for v in concrete]
+    assert exc_types.count("ExceptionGroup") == 2
+    assert exc_types.count("ValueError") == 1
+    assert exc_types.count("TypeError") == 1
+
+    # The cycle that closes during traversal (TypeError.__cause__ -> outer
+    # group, which is still active on the DFS path) is truncated with a
+    # reference instead of being expanded. The other back edge is beyond the
+    # truncation point and is therefore not traversed.
+    refs = [v for v in exception_values if "exception_ref" in v["mechanism"]]
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref["mechanism"]["source"] == "__cause__"
+    assert ref["mechanism"]["exception_ref"] == 0  # points at outer group
+    assert ref["mechanism"]["parent_id"] == 3  # edge originates at TypeError
+    assert "value" not in ref and "stacktrace" not in ref
+
+
+CLIENT_OPTIONS = {
+    "include_local_variables": True,
+    "include_source_context": True,
+    "max_value_length": 1024,
+}
+MECHANISM = {"type": "test_suite", "handled": False}
+
+
+def _values(exception):
+    (event, _) = event_from_exception(
+        exception,
+        client_options=CLIENT_OPTIONS,
+        mechanism=dict(MECHANISM),
+    )
+    values = event["exception"]["values"]
+    for value in values:
+        value.pop("stacktrace", None)
+        value.pop("module", None)
+    return values
+
+
+def _concrete(values):
+    """Nodes that carry a full serialized exception."""
+    return [v for v in values if "type" in v]
+
+
+def _references(values):
+    """Nodes that only reference another serialized node."""
+    return [v for v in values if "exception_ref" in v["mechanism"]]
+
+
+@minimum_python_311
+def test_shared_leaf_serialized_once():
+    """
+    The same exception object reachable through two branches of a group (as
+    happens when concurrent tasks propagate the *same* error object) must be
+    serialized exactly once; the second occurrence is an exception_ref.
+    """
+    shared = ValueError("shared failure")
+    group = ExceptionGroup("parallel", [shared, shared])
+
+    values = _values(group)
+
+    concrete = _concrete(values)
+    assert [v["type"] for v in concrete] == ["ValueError", "ExceptionGroup"]
+
+    value_errors = [v for v in concrete if v["type"] == "ValueError"]
+    assert len(value_errors) == 1
+    serialized_id = value_errors[0]["mechanism"]["exception_id"]
+
+    references = _references(values)
+    assert len(references) == 1
+    ref = references[0]
+    assert ref["mechanism"]["exception_ref"] == serialized_id
+    assert ref["mechanism"]["source"] == "exceptions[1]"
+    assert ref["mechanism"]["parent_id"] == 0
+    # references never duplicate the payload
+    assert "value" not in ref
+    assert "stacktrace" not in ref
+
+
+@minimum_python_311
+def test_shared_leaf_in_nested_groups_diamond():
+    """
+    Diamond: root -> [group_a, group_b] and both group_a/group_b contain the
+    same leaf object. The leaf is serialized once and the second occurrence
+    references it.
+    """
+    leaf = RuntimeError("diamond")
+    group_a = ExceptionGroup("a", [leaf])
+    group_b = ExceptionGroup("b", [leaf])
+    root = ExceptionGroup("root", [group_a, group_b])
+
+    values = _values(root)
+
+    runtime_errors = [v for v in _concrete(values) if v["type"] == "RuntimeError"]
+    assert len(runtime_errors) == 1
+    serialized_id = runtime_errors[0]["mechanism"]["exception_id"]
+
+    references = _references(values)
+    assert len(references) == 1
+    assert references[0]["mechanism"]["exception_ref"] == serialized_id
+
+    # Tree integrity: every non-root parent_id resolves to a serialized node
+    # and every reference resolves too.
+    concrete_ids = {v["mechanism"]["exception_id"] for v in _concrete(values)}
+    for v in values:
+        mechanism = v["mechanism"]
+        if "parent_id" in mechanism:
+            assert mechanism["parent_id"] in concrete_ids
+        if "exception_ref" in mechanism:
+            assert mechanism["exception_ref"] in concrete_ids
+
+
+@minimum_python_311
+def test_exception_tree_ids_are_stable():
+    """Building the same exception tree repeatedly yields identical ids."""
+
+    def structure():
+        leaf = RuntimeError("diamond")
+        root = ExceptionGroup(
+            "root",
+            [ExceptionGroup("a", [leaf]), ExceptionGroup("b", [leaf])],
+        )
+        values = _values(root)
+        return [
+            (
+                v["mechanism"].get("exception_id"),
+                v.get("type"),
+                v["mechanism"].get("parent_id"),
+                v["mechanism"].get("source"),
+                v["mechanism"].get("exception_ref"),
+            )
+            for v in values
+        ]
+
+    assert structure() == structure()
+
+
+@minimum_python_311
+def test_cause_vs_context_distinction_preserved():
+    """
+    __cause__ (raise ... from ...) and __context__ (implicit) must remain
+    distinguishable via mechanism.source and the chain edges must be linear
+    (child's parent is the containing exception, not the root).
+    """
+    cause = KeyError("direct")
+    with_cause = RuntimeError("with cause")
+    with_cause.__cause__ = cause
+    with_cause.__suppress_context__ = True
+
+    context = TypeError("implicit")
+    with_context = RuntimeError("with context")
+    with_context.__context__ = context
+
+    group = ExceptionGroup("g", [with_cause, with_context])
+    values = _values(group)
+    by_id = {v["mechanism"]["exception_id"]: v for v in values}
+
+    # with_cause -> __cause__ -> KeyError, edge parent is the RuntimeError node
+    runtime_nodes = {
+        v["value"]: v for v in values if v["type"] == "RuntimeError"
+    }
+    cause_holder = runtime_nodes["with cause"]
+    context_holder = runtime_nodes["with context"]
+
+    cause_node = next(v for v in values if v["type"] == "KeyError")
+    context_node = next(v for v in values if v["type"] == "TypeError")
+
+    assert cause_node["mechanism"]["source"] == "__cause__"
+    assert cause_node["mechanism"]["parent_id"] == cause_holder["mechanism"][
+        "exception_id"
+    ]
+
+    assert context_node["mechanism"]["source"] == "__context__"
+    assert context_node["mechanism"]["parent_id"] == context_holder["mechanism"][
+        "exception_id"
+    ]
+
+    # The group's two direct children use exceptions[i] sources.
+    assert cause_holder["mechanism"]["source"] == "exceptions[0]"
+    assert context_holder["mechanism"]["source"] == "exceptions[1]"
+    assert by_id[0]["type"] == "ExceptionGroup"
+
+
+@minimum_python_311
+def test_cancellation_branch_marked():
+    """
+    Cancellation branches (CancelledError members of an ExceptionGroup) are
+    flagged with mechanism.is_cancellation so they can be grouped separately
+    from genuine error branches.
+    """
+    import asyncio
+
+    group = BaseExceptionGroup(
+        "tasks", [RuntimeError("real error"), asyncio.CancelledError()]
+    )
+
+    values = _values(group)
+
+    by_type = {}
+    for v in _concrete(values):
+        by_type.setdefault(v["type"], []).append(v)
+
+    runtime = by_type["RuntimeError"][0]
+    cancellation = by_type["CancelledError"][0]
+
+    assert runtime["mechanism"].get("is_cancellation") is None
+    assert cancellation["mechanism"].get("is_cancellation") is True
+    assert cancellation["mechanism"]["source"] == "exceptions[1]"
+
+    # The group container itself is not a cancellation.
+    root = next(v for v in values if "is_exception_group" in v["mechanism"])
+    assert root["mechanism"].get("is_cancellation") is None
+
+
+@minimum_python_311
+def test_scrubbing_preserves_tree_structure():
+    """
+    Event scrubbing (sensitive frame vars) must not touch the tree metadata in
+    mechanism (ids/parent_id/exception_ref/source), so grouping structure
+    remains stable after scrubbing.
+    """
+    leaf = ValueError("secret failure")
+    root = ExceptionGroup("root", [ExceptionGroup("a", [leaf]), leaf])
+
+    values_before = _values(root)
+
+    # Scrub the whole event the way the client would.
+    (event, _) = event_from_exception(
+        root, client_options=CLIENT_OPTIONS, mechanism=dict(MECHANISM)
+    )
+    from sentry_sdk.scrubber import EventScrubber
+
+    EventScrubber(recursive=True).scrub_event(event)
+
+    values_after = event["exception"]["values"]
+
+    def tree_signature(values):
+        return sorted(
+            (
+                v["mechanism"].get("exception_id"),
+                v["mechanism"].get("parent_id"),
+                v["mechanism"].get("source"),
+                v["mechanism"].get("exception_ref"),
+                v["mechanism"].get("is_exception_group"),
+                v.get("type"),
+            )
+            for v in values
+        )
+
+    assert tree_signature(values_before) == tree_signature(values_after)
+
+
+@minimum_python_311
+def test_cycle_truncation_reference_is_valid_and_finite():
+    """
+    A self-referencing chain inside a group terminates and the truncation
+    reference always points at an existing serialized node.
+    """
+    leaf = ValueError("loopy")
+    leaf.__context__ = leaf  # direct self cycle
+
+    group = ExceptionGroup("g", [leaf])
+    values = _values(group)
+
+    concrete_ids = {v["mechanism"]["exception_id"] for v in _concrete(values)}
+    references = _references(values)
+    assert len(references) == 1
+    assert references[0]["mechanism"]["exception_ref"] in concrete_ids
+    assert references[0]["mechanism"]["source"] == "__context__"
+
+    # The leaf is serialized once with its full payload.
+    assert len([v for v in values if v.get("type") == "ValueError"]) == 1

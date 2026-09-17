@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes 🐛
+
+- Build a stable, identity-based exception tree for nested `ExceptionGroup`s from concurrent tasks. Each exception object is now serialized exactly once (additional occurrences are emitted as `mechanism.exception_ref` references), direct (`__cause__`) and contextual (`__context__`) causes keep distinct edges, cancellation branches (`CancelledError`) are flagged with `mechanism.is_cancellation`, and cyclic relationships are truncated safely with references instead of causing infinite recursion. This prevents duplicated leaves and distorted causal chains from skewing issue grouping.
+
 ## 2.61.0
 
 ### New Features ✨
