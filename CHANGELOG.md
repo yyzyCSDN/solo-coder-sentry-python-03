@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes 🐛
+
+- Improve exception tree serialization for (nested) `ExceptionGroup`s
+
+  - An exception object that appears multiple times in the tree (a leaf shared
+    between several exception groups, or a cycle in `__cause__`/`__context__`/
+    `exceptions` relations) is now serialized only once. Further occurrences
+    are emitted as lightweight reference nodes carrying
+    `mechanism.ref_exception_id`, so cycles are truncated safely and the tree
+    shape used for grouping stays intact instead of silently dropping edges.
+  - Fix `mechanism.parent_id` of `__cause__`/`__context__` children of nested
+    exceptions pointing at the root exception instead of their actual parent.
+  - Branches caused by task cancellation (`asyncio.CancelledError`,
+    `concurrent.futures.CancelledError`) are now marked with
+    `mechanism.is_cancelled` to distinguish them from actual failures.
+
 ## 2.61.0
 
 ### New Features ✨

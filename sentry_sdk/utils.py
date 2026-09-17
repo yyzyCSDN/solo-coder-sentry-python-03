@@ -676,6 +676,51 @@ def get_errno(exc_value: BaseException) -> "Optional[Any]":
     return getattr(exc_value, "errno", None)
 
 
+_CANCELLED_ERROR_TYPES = None  # type: Optional[Tuple[Type[BaseException], ...]]
+
+
+def _cancelled_error_types() -> "Tuple[Type[BaseException], ...]":
+    """
+    Returns the exception types that signal a cancelled concurrent task
+    (``asyncio.CancelledError`` and ``concurrent.futures.CancelledError``).
+
+    The imports are done lazily (and cached) so that importing this module
+    stays cheap and works even in exotic environments where one of the
+    modules is unavailable.
+    """
+    global _CANCELLED_ERROR_TYPES
+    if _CANCELLED_ERROR_TYPES is None:
+        cancelled_error_types = []  # type: List[Type[BaseException]]
+        try:
+            from asyncio import CancelledError as asyncio_cancelled_error
+
+            cancelled_error_types.append(asyncio_cancelled_error)
+        except ImportError:
+            pass
+        try:
+            from concurrent.futures import CancelledError as futures_cancelled_error
+
+            if futures_cancelled_error not in cancelled_error_types:
+                cancelled_error_types.append(futures_cancelled_error)
+        except ImportError:
+            pass
+        _CANCELLED_ERROR_TYPES = tuple(cancelled_error_types)
+
+    return _CANCELLED_ERROR_TYPES
+
+
+def _is_cancellation_error(exc_value: "Optional[BaseException]") -> bool:
+    """
+    Whether the exception represents the cancellation of a concurrent task
+    rather than an actual failure (e.g. a task that was cancelled because a
+    sibling task in the same ``TaskGroup``/``gather`` raised).
+    """
+    if exc_value is None:
+        return False
+
+    return isinstance(exc_value, _cancelled_error_types())
+
+
 def get_error_message(exc_value: "Optional[BaseException]") -> str:
     message: str = safe_str(
         getattr(exc_value, "message", "")
@@ -744,6 +789,13 @@ def single_exception_from_error_tuple(
     )
     if is_exception_group:
         exception_value["mechanism"]["is_exception_group"] = True
+
+    if _is_cancellation_error(exc_value):
+        # Distinguish branches that exist because a concurrent task was
+        # cancelled from branches that represent actual failures. This lives
+        # in the mechanism (not the value) so it survives event scrubbing
+        # and keeps grouping stable.
+        exception_value["mechanism"]["is_cancelled"] = True
 
     exception_value["module"] = get_type_module(exc_type)
     exception_value["type"] = get_type_name(exc_type)
@@ -835,6 +887,51 @@ else:
         yield exc_info
 
 
+def _exception_reference_from_error_tuple(
+    exc_type: "Optional[type]",
+    exc_value: "Optional[BaseException]",
+    mechanism: "Optional[Dict[str, Any]]",
+    exception_id: int,
+    parent_id: "Optional[int]",
+    source: "Optional[str]",
+    ref_exception_id: int,
+) -> "Dict[str, Any]":
+    """
+    Creates a lightweight reference to an exception object that was already
+    serialized elsewhere in the exception tree (a shared leaf or a cycle
+    back-edge).
+
+    The shared exception is serialized only once; every further occurrence
+    is represented by a reference node so that the shape of the tree (and
+    thus grouping) stays stable without duplicating payloads or recursing
+    forever on cyclic ``__cause__``/``__context__``/``exceptions`` relations.
+
+    The reference intentionally carries no ``value`` and no ``stacktrace``:
+    those live on the canonical node identified by ``ref_exception_id``.
+    All structural information lives in the ``mechanism`` so it is not
+    affected by event scrubbing.
+    """
+    reference_mechanism: "Dict[str, Any]" = (
+        mechanism.copy() if mechanism else {"handled": True}
+    )
+    reference_mechanism["type"] = "chained"
+    reference_mechanism["exception_id"] = exception_id
+    if parent_id is not None:
+        reference_mechanism["parent_id"] = parent_id
+    if source is not None:
+        reference_mechanism["source"] = source
+    reference_mechanism["ref_exception_id"] = ref_exception_id
+
+    if _is_cancellation_error(exc_value):
+        reference_mechanism["is_cancelled"] = True
+
+    return {
+        "module": get_type_module(exc_type),
+        "type": get_type_name(exc_type),
+        "mechanism": reference_mechanism,
+    }
+
+
 def exceptions_from_error(
     exc_type: "Optional[type]",
     exc_value: "Optional[BaseException]",
@@ -846,11 +943,22 @@ def exceptions_from_error(
     source: "Optional[str]" = None,
     full_stack: "Optional[list[dict[str, Any]]]" = None,
     seen_exceptions: "Optional[list[BaseException]]" = None,
-    seen_exception_ids: "Optional[Set[int]]" = None,
+    seen_exception_ids: "Optional[Dict[int, int]]" = None,
 ) -> "Tuple[int, List[Dict[str, Any]]]":
     """
     Creates the list of exceptions.
     This can include chained exceptions and exceptions from an ExceptionGroup.
+
+    The exceptions are serialized as a tree following the object relations
+    (``__cause__``, ``__context__`` and ``ExceptionGroup.exceptions``) in
+    pre-order, so the assigned ``exception_id`` values only depend on the
+    shape of the object graph and stay stable when event data is scrubbed.
+
+    Each exception object is serialized at most once. If the same object is
+    encountered again (a leaf shared between several exception groups, or a
+    cycle in the chain), a reference node is emitted instead of re-serializing
+    it. This truncates cyclic relations safely while keeping the tree shape
+    intact for grouping.
 
     See the Exception Interface documentation for more details:
     https://develop.sentry.dev/sdk/event-payloads/exception/
@@ -869,21 +977,44 @@ def exceptions_from_error(
             reconstruct the exception tree.
 
             Not to be confused with ``seen_exception_ids``, which tracks Python ``id()``
-            values for cycle detection.
+            values for deduplication and cycle detection.
+
+        seen_exception_ids (dict):
+
+            Maps the Python ``id()`` of each already serialized exception object
+            to its assigned ``mechanism.exception_id``. Used to serialize shared
+            objects only once and to safely truncate cycles by emitting
+            references to the canonical node.
     """
 
     if seen_exception_ids is None:
-        seen_exception_ids = set()
+        seen_exception_ids = {}
 
     if seen_exceptions is None:
         seen_exceptions = []
 
     if exc_value is not None and id(exc_value) in seen_exception_ids:
-        return (exception_id, [])
+        # This exception object was already serialized elsewhere in the tree
+        # (a shared leaf or a cycle back-edge). Serialize it only once and
+        # leave a reference behind, so the shape of the tree is preserved
+        # without duplicating the payload or recursing forever.
+        reference = _exception_reference_from_error_tuple(
+            exc_type=exc_type,
+            exc_value=exc_value,
+            mechanism=mechanism,
+            exception_id=exception_id,
+            parent_id=parent_id,
+            source=source,
+            ref_exception_id=seen_exception_ids[id(exc_value)],
+        )
+        return (exception_id + 1, [reference])
 
     if exc_value is not None:
+        # Avoid hashing random types we don't know anything
+        # about. Use the list to keep a ref so that the `id` is
+        # not used for another object.
         seen_exceptions.append(exc_value)
-        seen_exception_ids.add(id(exc_value))
+        seen_exception_ids[id(exc_value)] = exception_id
 
     parent = single_exception_from_error_tuple(
         exc_type=exc_type,
@@ -921,6 +1052,7 @@ def exceptions_from_error(
                 client_options=client_options,
                 mechanism=mechanism,
                 exception_id=exception_id,
+                parent_id=parent_id,
                 source="__cause__",
                 full_stack=full_stack,
                 seen_exceptions=seen_exceptions,
@@ -945,6 +1077,7 @@ def exceptions_from_error(
                 client_options=client_options,
                 mechanism=mechanism,
                 exception_id=exception_id,
+                parent_id=parent_id,
                 source="__context__",
                 full_stack=full_stack,
                 seen_exceptions=seen_exceptions,

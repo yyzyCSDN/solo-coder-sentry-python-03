@@ -1,14 +1,18 @@
+import asyncio
+import json
 import sys
 
 import pytest
 
+from sentry_sdk.scrubber import EventScrubber
 from sentry_sdk.utils import event_from_exception
 
 try:
     # Python 3.11
-    from builtins import ExceptionGroup  # type: ignore
+    from builtins import BaseExceptionGroup, ExceptionGroup  # type: ignore
 except ImportError:
     # Python 3.10 and below
+    BaseExceptionGroup = None
     ExceptionGroup = None
 
 
@@ -327,7 +331,9 @@ def test_exceptiongroup_starlette_collapse():
         ExceptionGroup -> .exceptions[0] -> ValueError -> __context__ -> ExceptionGroup
 
     Without cycle detection in exceptions_from_error(), this causes infinite
-    recursion and a silent RecursionError that drops the event.
+    recursion and a silent RecursionError that drops the event. The cycle is
+    truncated safely by emitting a reference to the already serialized
+    ExceptionGroup instead of serializing it again.
     """
     exception_group = None
 
@@ -369,6 +375,17 @@ def test_exceptiongroup_starlette_collapse():
             del x["module"]
 
     expected_values = [
+        {
+            "mechanism": {
+                "exception_id": 3,
+                "handled": False,
+                "parent_id": 2,
+                "ref_exception_id": 0,
+                "source": "__context__",
+                "type": "chained",
+            },
+            "type": "ExceptionGroup",
+        },
         {
             "mechanism": {
                 "exception_id": 2,
@@ -474,3 +491,224 @@ def test_deeply_nested_cyclic_exception_group():
     assert "ExceptionGroup" in exc_types
     assert "ValueError" in exc_types
     assert "TypeError" in exc_types
+
+
+CLIENT_OPTIONS = {
+    "include_local_variables": True,
+    "include_source_context": True,
+    "max_value_length": 1024,
+}
+
+TEST_MECHANISM = {"type": "test_suite", "handled": False}
+
+
+def _exceptions_by_id(event):
+    return {
+        value["mechanism"]["exception_id"]: value
+        for value in event["exception"]["values"]
+    }
+
+
+@minimum_python_311
+def test_exceptiongroup_shared_leaf_serialized_once():
+    """
+    The same exception object contained in several (nested) exception groups
+    must be serialized only once. Further occurrences become reference nodes
+    so that the shape of the exception tree is preserved for grouping.
+    """
+    shared_leaf = ValueError("shared failure")
+    exception_group = ExceptionGroup(
+        "outer",
+        [
+            ExceptionGroup("left", [shared_leaf]),
+            ExceptionGroup("right", [shared_leaf]),
+        ],
+    )
+
+    (event, _) = event_from_exception(
+        exception_group,
+        client_options=CLIENT_OPTIONS,
+        mechanism=TEST_MECHANISM,
+    )
+
+    values = event["exception"]["values"]
+    by_id = _exceptions_by_id(event)
+
+    # Pre-order ids: 0 outer group, 1 left group, 2 shared leaf,
+    # 3 right group, 4 reference to the shared leaf.
+    assert len(values) == 5
+
+    canonical = by_id[2]
+    assert canonical["type"] == "ValueError"
+    assert canonical["value"] == "shared failure"
+    assert canonical["mechanism"]["parent_id"] == 1
+    assert canonical["mechanism"]["source"] == "exceptions[0]"
+
+    reference = by_id[4]
+    assert reference["type"] == "ValueError"
+    # The reference does not duplicate the payload of the canonical node.
+    assert "value" not in reference
+    assert "stacktrace" not in reference
+    assert reference["mechanism"] == {
+        "type": "chained",
+        "handled": False,
+        "exception_id": 4,
+        "parent_id": 3,
+        "source": "exceptions[0]",
+        "ref_exception_id": 2,
+    }
+
+    # The shared leaf is serialized only once ...
+    assert sum(1 for v in values if v["type"] == "ValueError" and "value" in v) == 1
+    # ... but both groups keep their child edge, so the tree shape is stable.
+    assert by_id[1]["mechanism"]["is_exception_group"] is True
+    assert by_id[3]["mechanism"]["is_exception_group"] is True
+
+
+@minimum_python_311
+def test_exceptiongroup_cycle_truncated_with_reference():
+    """
+    A cycle in the object relations (here: a leaf whose __cause__ is the
+    group it belongs to) must be truncated safely, leaving a reference to
+    the already serialized exception instead of recursing forever.
+    """
+    exception_group = ExceptionGroup("cycle", [ValueError("leaf")])
+    leaf = exception_group.exceptions[0]
+    leaf.__cause__ = exception_group
+
+    (event, _) = event_from_exception(
+        exception_group,
+        client_options=CLIENT_OPTIONS,
+        mechanism=TEST_MECHANISM,
+    )
+
+    values = event["exception"]["values"]
+    by_id = _exceptions_by_id(event)
+
+    # Ids: 0 group, 1 leaf, 2 reference back to the group.
+    assert len(values) == 3
+
+    reference = by_id[2]
+    assert reference["type"] == "ExceptionGroup"
+    assert "value" not in reference
+    assert reference["mechanism"]["ref_exception_id"] == 0
+    assert reference["mechanism"]["parent_id"] == 1
+    assert reference["mechanism"]["source"] == "__cause__"
+
+
+@minimum_python_311
+def test_exceptiongroup_direct_cause_and_context_are_distinguished():
+    """
+    The direct cause (__cause__) and the contextual cause (__context__) of an
+    exception inside a group must keep their distinct sources, and must be
+    attached to their actual parent (not to the root of the tree).
+    """
+    try:
+        try:
+            raise KeyError("root cause")
+        except KeyError as e:
+            raise ValueError("wrapper") from e
+    except ValueError as wrapper:
+        exception_group = ExceptionGroup("outer", [wrapper])
+
+    (event, _) = event_from_exception(
+        exception_group,
+        client_options=CLIENT_OPTIONS,
+        mechanism=TEST_MECHANISM,
+    )
+
+    by_id = _exceptions_by_id(event)
+
+    # Ids: 0 group, 1 wrapper (exceptions[0]), 2 direct cause of the wrapper.
+    assert len(by_id) == 3
+
+    cause = by_id[2]
+    assert cause["type"] == "KeyError"
+    assert cause["mechanism"]["source"] == "__cause__"
+    # The cause belongs to the wrapper (id 1), not to the root of the tree.
+    assert cause["mechanism"]["parent_id"] == 1
+
+
+@minimum_python_311
+def test_exceptiongroup_cancelled_branch_marked():
+    """
+    Branches that exist because a concurrent task was cancelled must be
+    distinguishable from branches that represent actual failures.
+    """
+    exception_group = BaseExceptionGroup(
+        "mixed",
+        [
+            asyncio.CancelledError(),
+            ValueError("boom"),
+        ],
+    )
+
+    (event, _) = event_from_exception(
+        exception_group,
+        client_options=CLIENT_OPTIONS,
+        mechanism=TEST_MECHANISM,
+    )
+
+    by_id = _exceptions_by_id(event)
+
+    cancelled = by_id[1]
+    assert cancelled["type"] == "CancelledError"
+    assert cancelled["mechanism"]["is_cancelled"] is True
+    assert cancelled["mechanism"]["source"] == "exceptions[0]"
+
+    failure = by_id[2]
+    assert failure["type"] == "ValueError"
+    assert "is_cancelled" not in failure["mechanism"]
+
+
+def test_cancelled_error_marked_outside_groups():
+    (event, _) = event_from_exception(
+        asyncio.CancelledError(),
+        client_options=CLIENT_OPTIONS,
+        mechanism=TEST_MECHANISM,
+    )
+
+    (value,) = event["exception"]["values"]
+    assert value["type"] == "CancelledError"
+    assert value["mechanism"]["is_cancelled"] is True
+
+
+@minimum_python_311
+def test_exceptiongroup_structure_stable_after_scrubbing():
+    """
+    The structure needed for grouping (mechanism tree metadata and exception
+    types) must survive event scrubbing unchanged.
+    """
+    shared_leaf = ValueError("the token leaked")
+    exception_group = ExceptionGroup(
+        "outer",
+        [
+            ExceptionGroup("inner", [shared_leaf]),
+            shared_leaf,
+        ],
+    )
+
+    (event, _) = event_from_exception(
+        exception_group,
+        client_options=CLIENT_OPTIONS,
+        mechanism=TEST_MECHANISM,
+    )
+
+    structure_before = json.dumps(
+        [(value["type"], value["mechanism"]) for value in event["exception"]["values"]],
+        sort_keys=True,
+    )
+
+    EventScrubber(denylist=["token"], recursive=True).scrub_event(event)
+
+    structure_after = json.dumps(
+        [(value["type"], value["mechanism"]) for value in event["exception"]["values"]],
+        sort_keys=True,
+    )
+
+    assert structure_after == structure_before
+
+    # The reference to the shared leaf in particular is still intact.
+    by_id = _exceptions_by_id(event)
+    assert by_id[3]["mechanism"]["ref_exception_id"] == 2
+    assert by_id[3]["mechanism"]["parent_id"] == 0
